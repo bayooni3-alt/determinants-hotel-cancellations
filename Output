@@ -1,0 +1,1130 @@
+Output
+Adebayo
+2026-11-11
+# =============================================================================
+# HOTEL BOOKING CANCELLATION — PhD-LEVEL ANALYSIS
+# Complete, corrected, run-ready script (v7 — FINAL)
+# -----------------------------------------------------------------------------
+# v7 fixes vs. v6:
+#   FIX-DISC-1A: explicit 1,000-row sample from hotel_bookings_full.csv
+#                (seed = 20250101); falls back to pre-subsetted file if absent
+#   FIX-DISC-2A: Hosmer-Lemeshow suppressed under quasi-complete separation;
+#                Table 6b records the reason
+# =============================================================================
+
+# =============================================================================
+# 1. SETUP, REPRODUCIBILITY, PACKAGES
+# =============================================================================
+set.seed(20250101)
+
+required_packages <- c(
+  "tidyverse", "janitor", "skimr", "DataExplorer", "corrplot",
+  "car", "MASS", "pROC", "caret", "randomForest", "rpart", "rpart.plot",
+  "vip", "effects", "emmeans", "broom", "knitr", "kableExtra",
+  "patchwork", "scales", "ggpubr", "psych", "nortest", "lmtest",
+  "sandwich", "boot", "pwr", "glmnet", "xgboost", "shapviz",
+  "MatchIt", "lme4", "logistf", "here", "lubridate", "readr"
+)
+
+install_if_missing <- function(pkgs) {
+  for (p in pkgs) {
+    if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  }
+}
+install_if_missing(required_packages)
+## Registered S3 method overwritten by 'lme4':
+##   method           from
+##   na.action.merMod car
+suppressPackageStartupMessages({
+  library(tidyverse);   library(janitor);    library(skimr)
+  library(DataExplorer);library(corrplot);   library(car)
+  library(MASS);        library(pROC);       library(caret)
+  library(randomForest);library(rpart);      library(rpart.plot)
+  library(vip);         library(effects);    library(emmeans)
+  library(broom);       library(knitr);      library(kableExtra)
+  library(patchwork);   library(scales);     library(ggpubr)
+  library(psych);       library(nortest);    library(lmtest)
+  library(sandwich);    library(boot);       library(pwr)
+  library(glmnet);      library(xgboost);    library(shapviz)
+  library(MatchIt);     library(lme4);       library(logistf)
+  library(here);        library(lubridate);  library(readr)
+})
+
+options(scipen = 999)
+
+dir.create(here::here("outputs"), showWarnings = FALSE)
+dir.create(here::here("figures"), showWarnings = FALSE)
+
+write_table <- function(df, name, caption = NULL) {
+  readr::write_csv(df, here::here("outputs", paste0(name, ".csv")))
+  k <- knitr::kable(df, caption = caption, format = "html") %>%
+    kableExtra::kable_styling(bootstrap_options = c("striped", "hover"))
+  readr::write_file(as.character(k),
+                    here::here("outputs", paste0(name, ".html")))
+  invisible(df)
+}
+
+safe_plot <- function(expr, file, width = 7, height = 5) {
+  tryCatch({
+    p <- force(expr)
+    if (inherits(p, "ggplot")) {
+      ggplot2::ggsave(here::here("figures", file), p,
+                      width = width, height = height, dpi = 300)
+    } else if (!is.null(dev.list())) dev.off()
+    invisible(p)
+  }, error = function(e) message("Figure skipped (", file, "): ",
+                                 conditionMessage(e)))
+}
+
+# =============================================================================
+# 2. DATA IMPORT  (FIX-DISC-1A: explicit, reproducible 1,000-row sample)
+# =============================================================================
+# Preferred: place the FULL Kaggle file as hotel_bookings_full.csv in project root.
+# Fallback: if absent, use the pre-subsetted hotel_bookings.csv (no sampling).
+full_path <- here::here("hotel_bookings_full.csv")
+sub_path  <- here::here("hotel_bookings.csv")
+
+if (file.exists(full_path)) {
+  full_raw <- read.csv(full_path, stringsAsFactors = FALSE)
+  set.seed(20250101)
+  raw <- full_raw[sample(nrow(full_raw), 1000), ]
+  rownames(raw) <- NULL
+  cat("Sampled 1,000 rows from", nrow(full_raw),
+      "— seed 20250101\n")
+} else if (file.exists(sub_path)) {
+  raw <- read.csv(sub_path, stringsAsFactors = FALSE)
+  message("Full Kaggle file not found — using pre-subsetted hotel_bookings.csv (no sampling).")
+} else {
+  stop("Place hotel_bookings_full.csv (or hotel_bookings.csv) in the project root.")
+}
+## Full Kaggle file not found — using pre-subsetted hotel_bookings.csv (no sampling).
+hotel <- raw %>%
+  janitor::clean_names() %>%
+  dplyr::select(-any_of("rownames"))
+
+cat("\n--- STRUCTURE ---\n");   str(hotel)
+## 
+## --- STRUCTURE ---
+## 'data.frame':    1000 obs. of  32 variables:
+##  $ hotel                         : chr  "City Hotel" "Resort Hotel" "Resort Hotel" "Resort Hotel" ...
+##  $ is_canceled                   : int  1 1 0 0 0 0 0 0 1 1 ...
+##  $ lead_time                     : int  1 19 9 110 329 212 14 58 88 373 ...
+##  $ arrival_date_year             : int  2015 2016 2017 2016 2017 2017 2017 2016 2017 2017 ...
+##  $ arrival_date_month            : chr  "September" "March" "August" "November" ...
+##  $ arrival_date_week_number      : int  40 12 31 46 30 35 5 41 20 14 ...
+##  $ arrival_date_day_of_month     : int  30 19 1 11 27 31 29 3 17 5 ...
+##  $ stays_in_weekend_nights       : int  0 2 0 0 0 2 2 2 0 0 ...
+##  $ stays_in_week_nights          : int  2 4 4 1 2 8 0 5 3 3 ...
+##  $ adults                        : int  1 2 2 2 2 2 1 2 2 2 ...
+##  $ children                      : int  0 0 0 0 0 1 0 0 0 0 ...
+##  $ babies                        : int  0 0 0 0 0 0 0 0 0 0 ...
+##  $ meal                          : chr  "BB" "BB" "HB" "BB" ...
+##  $ country                       : chr  "PRT" "PRT" "ESP" "BRA" ...
+##  $ market_segment                : chr  "Offline TA/TO" "Online TA" "Online TA" "Online TA" ...
+##  $ distribution_channel          : chr  "TA/TO" "TA/TO" "TA/TO" "TA/TO" ...
+##  $ is_repeated_guest             : int  1 0 0 0 0 0 1 0 0 0 ...
+##  $ previous_cancellations        : int  1 0 0 0 0 0 0 0 0 0 ...
+##  $ previous_bookings_not_canceled: int  0 0 0 0 0 0 1 0 0 0 ...
+##  $ reserved_room_type            : chr  "A" "D" "A" "A" ...
+##  $ assigned_room_type            : chr  "A" "D" "A" "A" ...
+##  $ booking_changes               : int  0 0 0 2 0 1 0 0 0 0 ...
+##  $ deposit_type                  : chr  "Non Refund" "No Deposit" "No Deposit" "No Deposit" ...
+##  $ agent                         : chr  "50" "240" "241" "314" ...
+##  $ company                       : chr  "NULL" "NULL" "NULL" "NULL" ...
+##  $ days_in_waiting_list          : int  0 0 0 0 0 0 0 0 0 0 ...
+##  $ customer_type                 : chr  "Transient" "Transient" "Transient" "Transient" ...
+##  $ average_daily_rate            : num  98.1 70.2 193.4 36.2 89.1 ...
+##  $ required_car_parking_spaces   : int  0 0 0 1 0 0 0 1 0 0 ...
+##  $ total_of_special_requests     : int  0 1 1 0 1 0 2 1 0 0 ...
+##  $ reservation_status            : chr  "Canceled" "Canceled" "Check-Out" "Check-Out" ...
+##  $ reservation_status_date       : chr  "9/29/2015" "3/2/2016" "8/5/2017" "11/12/2016" ...
+cat("\n--- DIMENSIONS ---\n");  print(dim(hotel))
+## 
+## --- DIMENSIONS ---
+## [1] 1000   32
+missing_tab <- hotel %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(pct_missing = round(100 * n_missing / nrow(hotel), 2)) %>%
+  arrange(desc(n_missing))
+write_table(missing_tab, "table_00_missingness", "Missingness by Variable")
+
+# =============================================================================
+# 3. CLEANING, TYPE COERCION, FEATURE ENGINEERING
+# =============================================================================
+hotel_clean <- hotel %>%
+  mutate(
+    across(c(hotel, arrival_date_month, meal, country, market_segment,
+             distribution_channel, deposit_type, customer_type,
+             reservation_status),
+           as.factor),
+    agent   = na_if(agent, "NULL"),
+    company = na_if(company, "NULL"),
+    agent   = suppressWarnings(as.numeric(agent)),
+    company = suppressWarnings(as.numeric(company)),
+    reservation_status_date = as.Date(reservation_status_date, "%m/%d/%Y"),
+    is_canceled = factor(is_canceled, levels = c(0, 1),
+                         labels = c("Not_Canceled", "Canceled")),
+    total_nights = stays_in_weekend_nights + stays_in_week_nights,
+    total_guests = adults + children + babies,
+    revenue      = average_daily_rate * total_nights,
+    room_changed = as.integer(as.character(reserved_room_type) !=
+                                as.character(assigned_room_type)),
+    has_agent    = as.integer(!is.na(agent)),
+    has_company  = as.integer(!is.na(company)),
+    arrival_date = as.Date(
+      paste(arrival_date_year, arrival_date_month,
+            arrival_date_day_of_month, sep = "-"),
+      format = "%Y-%B-%d"
+    ),
+    arrival_quarter = factor(lubridate::quarter(arrival_date)),
+    arrival_dow     = factor(lubridate::wday(arrival_date, label = TRUE))
+  ) %>%
+  mutate(
+    reserved_room_type = as.factor(reserved_room_type),
+    assigned_room_type = as.factor(assigned_room_type)
+  )
+
+cat("\n[TRACE] after coercion:", nrow(hotel_clean), "\n")
+## 
+## [TRACE] after coercion: 1000
+hotel_clean <- hotel_clean %>% filter(adults + children + babies > 0)
+cat("[TRACE] after total_guests > 0:", nrow(hotel_clean), "\n")
+## [TRACE] after total_guests > 0: 997
+hotel_clean <- hotel_clean %>% filter(total_nights > 0)
+cat("[TRACE] after total_nights > 0:", nrow(hotel_clean), "\n")
+## [TRACE] after total_nights > 0: 995
+hotel_clean <- hotel_clean %>% filter(average_daily_rate > 0)
+cat("[TRACE] after ADR > 0:", nrow(hotel_clean), "\n")
+## [TRACE] after ADR > 0: 985
+hotel_clean <- hotel_clean %>%
+  dplyr::select(where(~ !all(is.na(.)))) %>%
+  droplevels()
+
+cat("\n--- CLEAN DIMENSIONS ---\n"); print(dim(hotel_clean))
+## 
+## --- CLEAN DIMENSIONS ---
+## [1] 985  41
+leak_vars <- c("reservation_status", "reservation_status_date", "arrival_date")
+model_df  <- hotel_clean %>% dplyr::select(-all_of(leak_vars))
+cat("\n[TRACE] model_df rows:", nrow(model_df), "\n")
+## 
+## [TRACE] model_df rows: 985
+# =============================================================================
+# 4. EXPLORATORY ANALYSIS (figures)
+# =============================================================================
+num_vars <- c("lead_time", "average_daily_rate", "total_nights",
+              "total_guests", "total_of_special_requests",
+              "booking_changes", "previous_cancellations")
+cat_vars <- c("hotel", "market_segment", "deposit_type",
+              "customer_type", "arrival_date_month")
+
+safe_plot(
+  ggplot(hotel_clean, aes(is_canceled, fill = is_canceled)) +
+    geom_bar() +
+    geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+    scale_fill_manual(values = c("#2E86AB", "#D7263D")) +
+    labs(title = "Distribution of Booking Cancellation",
+         x = NULL, y = "Count") +
+    theme_minimal(base_size = 13) + theme(legend.position = "none"),
+  "fig_target_distribution.png", 6, 4)
+
+safe_plot(
+  hotel_clean %>%
+    dplyr::select(all_of(num_vars), is_canceled) %>%
+    pivot_longer(-is_canceled, names_to = "variable", values_to = "value") %>%
+    ggplot(aes(value, fill = is_canceled)) +
+    geom_density(alpha = 0.5) +
+    facet_wrap(~ variable, scales = "free", ncol = 3) +
+    scale_fill_manual(values = c("#2E86AB", "#D7263D")) +
+    labs(title = "Numeric Predictors by Cancellation Status",
+         x = NULL, y = "Density", fill = "Status") +
+    theme_minimal(base_size = 12),
+  "fig_numeric_density.png", 10, 6)
+
+for (v in cat_vars) {
+  local({
+    vv <- v
+    safe_plot(
+      ggplot(hotel_clean, aes(.data[[vv]], fill = is_canceled)) +
+        geom_bar(position = "fill") +
+        scale_y_continuous(labels = percent) +
+        scale_fill_manual(values = c("#2E86AB", "#D7263D")) +
+        labs(title = paste("Cancellation Rate by", vv),
+             x = NULL, y = "Proportion", fill = "Status") +
+        theme_minimal(base_size = 12) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)),
+      paste0("fig_cat_", vv, ".png"), 7, 4)
+  })
+}
+
+num_data <- hotel_clean %>% dplyr::select(where(is.numeric))
+zero_sd  <- names(which(sapply(num_data, sd, na.rm = TRUE) == 0))
+if (length(zero_sd) > 0) num_data <- num_data %>% dplyr::select(-all_of(zero_sd))
+cor_mat <- cor(num_data, use = "pairwise.complete.obs")
+## Warning in cor(num_data, use = "pairwise.complete.obs"): the standard deviation
+## is zero
+tryCatch({
+  png(here::here("figures", "fig_correlation_matrix.png"),
+      width = 900, height = 900, res = 120)
+  corrplot(cor_mat, method = "color", type = "upper",
+           tl.cex = 0.5, tl.col = "black", number.cex = 0.5,
+           title = "Correlation Matrix", mar = c(0, 0, 2, 0))
+  dev.off()
+}, error = function(e) { if (!is.null(dev.list())) dev.off() })
+## png 
+##   2
+# =============================================================================
+# 5. FORMAL STATISTICAL TESTING
+# =============================================================================
+n_sw <- min(5000, nrow(hotel_clean))
+cat("\n--- SHAPIRO-WILK (lead_time) ---\n")
+## 
+## --- SHAPIRO-WILK (lead_time) ---
+print(shapiro.test(sample(hotel_clean$lead_time, n_sw)))
+## 
+##  Shapiro-Wilk normality test
+## 
+## data:  sample(hotel_clean$lead_time, n_sw)
+## W = 0.86118, p-value < 0.00000000000000022
+cat("\n--- SHAPIRO-WILK (ADR) ---\n")
+## 
+## --- SHAPIRO-WILK (ADR) ---
+print(shapiro.test(sample(hotel_clean$average_daily_rate, n_sw)))
+## 
+##  Shapiro-Wilk normality test
+## 
+## data:  sample(hotel_clean$average_daily_rate, n_sw)
+## W = 0.94653, p-value < 0.00000000000000022
+wilcox_results <- purrr::map_dfr(num_vars, function(v) {
+  f  <- as.formula(paste(v, "~ is_canceled"))
+  wt <- wilcox.test(f, data = hotel_clean)
+  tibble(variable = v, W = unname(wt$statistic), p_value = wt$p.value)
+}) %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "BH"),
+    Sig.  = case_when(p_adj < 0.001 ~ "***",
+                      p_adj < 0.01  ~ "**",
+                      p_adj < 0.05  ~ "*",
+                      TRUE          ~ "ns")
+  )
+write_table(wilcox_results, "table_02_wilcoxon",
+            "Table 2. Wilcoxon Rank-Sum Tests")
+
+chi_results <- purrr::map_dfr(cat_vars, function(v) {
+  tab <- table(hotel_clean[[v]], hotel_clean$is_canceled)
+  ct  <- suppressWarnings(chisq.test(tab, simulate.p.value = TRUE, B = 2000))
+  tibble(variable = v,
+         chi_sq  = unname(ct$statistic),
+         df      = if (!is.null(ct$parameter)) unname(ct$parameter) else NA_real_,
+         p_value = ct$p.value)
+}) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH"))
+write_table(chi_results, "table_03_chisq",
+            "Table 3. Chi-Square Tests of Independence")
+
+cramers_v <- function(tab) {
+  chi2 <- suppressWarnings(chisq.test(tab, simulate.p.value = TRUE, B = 2000)$statistic)
+  sqrt(chi2 / (sum(tab) * (min(dim(tab)) - 1)))
+}
+cv_tab <- purrr::map_dfr(cat_vars, function(v) {
+  tibble(variable  = v,
+         cramers_v = round(cramers_v(table(hotel_clean[[v]],
+                                           hotel_clean$is_canceled)), 3))
+}) %>%
+  mutate(Magnitude = case_when(
+    cramers_v < 0.10 ~ "Negligible",
+    cramers_v < 0.20 ~ "Small",
+    cramers_v < 0.30 ~ "Small-medium",
+    cramers_v < 0.40 ~ "Medium",
+    TRUE             ~ "Medium-large"
+  ))
+write_table(cv_tab, "table_04_cramers_v", "Table 4. Cramér's V Effect Sizes")
+
+# =============================================================================
+# 6. LOGISTIC REGRESSION
+# =============================================================================
+logit_full <- suppressWarnings(
+  glm(
+    is_canceled ~ lead_time + average_daily_rate + total_nights +
+      total_guests + total_of_special_requests + booking_changes +
+      previous_cancellations + is_repeated_guest +
+      required_car_parking_spaces + hotel + market_segment +
+      deposit_type + customer_type + arrival_date_month,
+    data = model_df, family = binomial(link = "logit")
+  )
+)
+cat("\n--- LOGISTIC REGRESSION SUMMARY ---\n")
+## 
+## --- LOGISTIC REGRESSION SUMMARY ---
+print(summary(logit_full))
+## 
+## Call:
+## glm(formula = is_canceled ~ lead_time + average_daily_rate + 
+##     total_nights + total_guests + total_of_special_requests + 
+##     booking_changes + previous_cancellations + is_repeated_guest + 
+##     required_car_parking_spaces + hotel + market_segment + deposit_type + 
+##     customer_type + arrival_date_month, family = binomial(link = "logit"), 
+##     data = model_df)
+## 
+## Coefficients:
+##                                 Estimate  Std. Error z value           Pr(>|z|)
+## (Intercept)                    -3.117603    0.990373  -3.148           0.001644
+## lead_time                       0.004467    0.001131   3.950 0.0000780084248661
+## average_daily_rate              0.007733    0.002585   2.992           0.002773
+## total_nights                    0.043952    0.040604   1.082           0.279050
+## total_guests                    0.410441    0.145456   2.822           0.004776
+## total_of_special_requests      -1.076683    0.144112  -7.471 0.0000000000000795
+## booking_changes                -0.814498    0.214295  -3.801           0.000144
+## previous_cancellations          2.313214    0.598025   3.868           0.000110
+## is_repeated_guest               0.367848    0.771076   0.477           0.633321
+## required_car_parking_spaces   -17.430906  744.951066  -0.023           0.981332
+## hotelResort Hotel              -0.161268    0.202563  -0.796           0.425952
+## market_segmentDirect           -0.726475    0.655703  -1.108           0.267891
+## market_segmentGroups           -0.005018    0.625373  -0.008           0.993598
+## market_segmentOffline TA/TO    -0.658516    0.603121  -1.092           0.274901
+## market_segmentOnline TA         1.228664    0.581748   2.112           0.034685
+## deposit_typeNon Refund         18.790339  516.689918   0.036           0.970990
+## deposit_typeRefundable        -15.944039 3234.363175  -0.005           0.996067
+## customer_typeGroup            -15.115617 3136.865733  -0.005           0.996155
+## customer_typeTransient          0.539479    0.702135   0.768           0.442285
+## customer_typeTransient-Party    0.557133    0.725914   0.767           0.442789
+## arrival_date_monthAugust       -0.744693    0.409442  -1.819           0.068942
+## arrival_date_monthDecember      0.028750    0.447000   0.064           0.948718
+## arrival_date_monthFebruary      0.034169    0.453624   0.075           0.939957
+## arrival_date_monthJanuary      -0.131139    0.499803  -0.262           0.793027
+## arrival_date_monthJuly         -0.501597    0.394722  -1.271           0.203815
+## arrival_date_monthJune         -0.178152    0.425312  -0.419           0.675308
+## arrival_date_monthMarch        -0.147690    0.459347  -0.322           0.747816
+## arrival_date_monthMay          -0.552518    0.387766  -1.425           0.154193
+## arrival_date_monthNovember     -0.708325    0.600726  -1.179           0.238353
+## arrival_date_monthOctober       0.218175    0.421014   0.518           0.604309
+## arrival_date_monthSeptember    -0.424922    0.460449  -0.923           0.356089
+##                                 
+## (Intercept)                  ** 
+## lead_time                    ***
+## average_daily_rate           ** 
+## total_nights                    
+## total_guests                 ** 
+## total_of_special_requests    ***
+## booking_changes              ***
+## previous_cancellations       ***
+## is_repeated_guest               
+## required_car_parking_spaces     
+## hotelResort Hotel               
+## market_segmentDirect            
+## market_segmentGroups            
+## market_segmentOffline TA/TO     
+## market_segmentOnline TA      *  
+## deposit_typeNon Refund          
+## deposit_typeRefundable          
+## customer_typeGroup              
+## customer_typeTransient          
+## customer_typeTransient-Party    
+## arrival_date_monthAugust     .  
+## arrival_date_monthDecember      
+## arrival_date_monthFebruary      
+## arrival_date_monthJanuary       
+## arrival_date_monthJuly          
+## arrival_date_monthJune          
+## arrival_date_monthMarch         
+## arrival_date_monthMay           
+## arrival_date_monthNovember      
+## arrival_date_monthOctober       
+## arrival_date_monthSeptember     
+## ---
+## Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+## 
+## (Dispersion parameter for binomial family taken to be 1)
+## 
+##     Null deviance: 1297.66  on 984  degrees of freedom
+## Residual deviance:  778.05  on 954  degrees of freedom
+## AIC: 840.05
+## 
+## Number of Fisher Scoring iterations: 17
+separation_terms <- c("required_car_parking_spaces",
+                      "deposit_typeNon Refund",
+                      "deposit_typeRefundable",
+                      "customer_typeGroup")
+
+or_tab_full <- suppressWarnings(
+  broom::tidy(logit_full, exponentiate = TRUE, conf.int = TRUE)
+) %>%
+  dplyr::filter(term != "(Intercept)") %>%
+  dplyr::mutate(
+    Separation = term %in% separation_terms,
+    OR         = ifelse(Separation, NA, round(estimate, 3)),
+    `CI lower` = ifelse(Separation, NA, round(conf.low, 3)),
+    `CI upper` = ifelse(Separation, NA, round(conf.high, 3)),
+    p          = round(p.value, 4),
+    Sig.       = case_when(p.value < 0.001 ~ "***",
+                           p.value < 0.01  ~ "**",
+                           p.value < 0.05  ~ "*",
+                           TRUE            ~ "ns")
+  ) %>%
+  dplyr::select(term, OR, `CI lower`, `CI upper`, p, Sig., Separation)
+
+write_table(or_tab_full, "table_05a_odds_ratios_full",
+            "Logistic Regression: Full Odds Ratio Table (separation flagged)")
+
+table5_terms <- c(
+  "lead_time", "average_daily_rate", "total_nights", "total_guests",
+  "total_of_special_requests", "booking_changes", "previous_cancellations",
+  "is_repeated_guest", "market_segmentOnline TA", "hotelResort Hotel",
+  "required_car_parking_spaces", "deposit_typeNon Refund"
+)
+table5 <- or_tab_full %>%
+  dplyr::filter(term %in% table5_terms) %>%
+  dplyr::mutate(term = factor(term, levels = table5_terms)) %>%
+  dplyr::arrange(term) %>%
+  dplyr::mutate(
+    term = as.character(term),
+    OR   = case_when(
+      Separation & term == "required_car_parking_spaces" ~ "~0 (separation)",
+      Separation & term == "deposit_typeNon Refund"      ~ "exploded (separation)",
+      TRUE ~ as.character(OR)
+    )
+  )
+write_table(table5, "table_05_logistic_or_key",
+            "Table 5. Logistic Regression Odds Ratios (Key Predictors)")
+
+vif_vals <- tryCatch(car::vif(logit_full),
+                     error = function(e) paste("VIF error:", e$message))
+cat("\n--- VIF ---\n"); print(vif_vals)
+## 
+## --- VIF ---
+##                                 GVIF Df GVIF^(1/(2*Df))
+## lead_time                   1.453648  1        1.205673
+## average_daily_rate          1.775112  1        1.332333
+## total_nights                1.242410  1        1.114634
+## total_guests                1.326151  1        1.151586
+## total_of_special_requests   1.278311  1        1.130624
+## booking_changes             1.047083  1        1.023271
+## previous_cancellations      1.131540  1        1.063739
+## is_repeated_guest           1.261188  1        1.123026
+## required_car_parking_spaces 1.000000  1        1.000000
+## hotel                       1.139939  1        1.067679
+## market_segment              3.422236  4        1.166242
+## deposit_type                1.000000  2        1.000000
+## customer_type               2.307690  3        1.149555
+## arrival_date_month          1.902432 11        1.029665
+null_dev <- logit_full$null.deviance
+res_dev  <- logit_full$deviance
+mcf_r2   <- 1 - res_dev / null_dev
+fit_stats <- tibble(
+  Metric = c("Null Deviance", "Residual Deviance", "McFadden R2",
+             "AIC", "BIC", "n"),
+  Value  = round(c(null_dev, res_dev, mcf_r2,
+                   AIC(logit_full), BIC(logit_full), nobs(logit_full)), 3)
+)
+write_table(fit_stats, "table_06_fit_stats",
+            "Table 6. Logistic Regression Fit Statistics")
+
+# --- 6.5 Hosmer-Lemeshow (FIX-DISC-2A: suppress under separation) ---
+hoslem_test <- function(model, g = 10) {
+  y     <- as.numeric(model$y) - 1
+  p     <- fitted(model)
+  q     <- unique(quantile(p, probs = seq(0, 1, 1/g)))
+  cut_p <- cut(p, breaks = q, include.lowest = TRUE)
+  obs   <- tapply(y, cut_p, sum); exp_ <- tapply(p, cut_p, sum)
+  n     <- tapply(y, cut_p, length)
+  chi2  <- sum((obs - exp_)^2 / (exp_ * (1 - exp_/n)))
+  list(statistic = chi2, df = length(obs) - 2,
+       p.value = pchisq(chi2, length(obs) - 2, lower.tail = FALSE))
+}
+
+hl <- hoslem_test(logit_full)
+if (is.finite(hl$statistic) && hl$statistic < 1e4) {
+  cat("\n--- HOSMER-LEMESHOW ---\n"); print(hl)
+  write_table(
+    tibble(Metric = c("HL statistic", "df", "p-value"),
+           Value  = round(c(hl$statistic, hl$df, hl$p.value), 4)),
+    "table_06b_hoslem", "Hosmer-Lemeshow Goodness-of-Fit"
+  )
+} else {
+  cat("\n--- HOSMER-LEMESHOW: skipped (quasi-complete separation) ---\n")
+  cat("    Use Firth model (Table 7) for deposit_type inference.\n")
+  write_table(
+    tibble(Metric = "Hosmer-Lemeshow",
+           Value  = paste("Not reported — invalid under quasi-complete",
+                          "separation; see Firth (Table 7)")),
+    "table_06b_hoslem", "Hosmer-Lemeshow Goodness-of-Fit"
+  )
+}
+## 
+## --- HOSMER-LEMESHOW: skipped (quasi-complete separation) ---
+##     Use Firth model (Table 7) for deposit_type inference.
+prob_pred <- predict(logit_full, type = "response")
+roc_obj   <- pROC::roc(model_df$is_canceled, prob_pred,
+                       levels = c("Not_Canceled", "Canceled"))
+## Setting direction: controls < cases
+auc_val   <- as.numeric(pROC::auc(roc_obj))
+best_thr  <- pROC::coords(roc_obj, "best", ret = "threshold")
+pred_class <- ifelse(prob_pred > best_thr$threshold,
+                     "Canceled", "Not_Canceled")
+conf_mat <- caret::confusionMatrix(
+  factor(pred_class, levels = c("Not_Canceled", "Canceled")),
+  model_df$is_canceled)
+cat("\n--- CONFUSION MATRIX ---\n"); print(conf_mat)
+## 
+## --- CONFUSION MATRIX ---
+## Confusion Matrix and Statistics
+## 
+##               Reference
+## Prediction     Not_Canceled Canceled
+##   Not_Canceled          560      110
+##   Canceled               61      254
+##                                                
+##                Accuracy : 0.8264               
+##                  95% CI : (0.8013, 0.8496)     
+##     No Information Rate : 0.6305               
+##     P-Value [Acc > NIR] : < 0.00000000000000022
+##                                                
+##                   Kappa : 0.6168               
+##                                                
+##  Mcnemar's Test P-Value : 0.0002419            
+##                                                
+##             Sensitivity : 0.9018               
+##             Specificity : 0.6978               
+##          Pos Pred Value : 0.8358               
+##          Neg Pred Value : 0.8063               
+##              Prevalence : 0.6305               
+##          Detection Rate : 0.5685               
+##    Detection Prevalence : 0.6802               
+##       Balanced Accuracy : 0.7998               
+##                                                
+##        'Positive' Class : Not_Canceled         
+## 
+table12 <- tibble(
+  `Fit Index`     = c("AUC", "McFadden R2", "Accuracy",
+                      "Sensitivity", "Specificity", "Kappa"),
+  `Full Logistic` = c(round(auc_val, 3),
+                      round(mcf_r2, 3),
+                      round(conf_mat$overall["Accuracy"], 3),
+                      round(conf_mat$byClass["Sensitivity"], 3),
+                      round(conf_mat$byClass["Specificity"], 3),
+                      round(conf_mat$overall["Kappa"], 3)),
+  Firth   = c(NA, NA, NA, NA, NA, NA),
+  XGBoost = c(NA, NA, NA, NA, NA, NA)
+)
+
+# =============================================================================
+# 7. MACHINE LEARNING BENCHMARKING
+# =============================================================================
+set.seed(20250101)
+train_idx <- caret::createDataPartition(model_df$is_canceled, p = 0.7, list = FALSE)
+train_df  <- model_df[train_idx, ]
+test_df   <- model_df[-train_idx, ]
+
+mm_formula <- is_canceled ~ lead_time + average_daily_rate + total_nights +
+  total_guests + total_of_special_requests + booking_changes +
+  previous_cancellations + is_repeated_guest +
+  required_car_parking_spaces + hotel + market_segment +
+  deposit_type + customer_type + arrival_date_month
+
+x_train <- model.matrix(mm_formula, data = train_df)[, -1]
+y_train <- as.numeric(train_df$is_canceled) - 1
+x_test  <- model.matrix(mm_formula, data = test_df)[, -1]
+y_test  <- as.numeric(test_df$is_canceled) - 1
+
+set.seed(20250101)
+cv_lasso   <- glmnet::cv.glmnet(x_train, y_train, family = "binomial", alpha = 1)
+lasso_pred <- as.numeric(predict(cv_lasso, newx = x_test, s = "lambda.min",
+                                 type = "response"))
+auc_lasso  <- as.numeric(pROC::auc(pROC::roc(y_test, lasso_pred, quiet = TRUE)))
+
+set.seed(20250101)
+rf_fit <- randomForest::randomForest(
+  is_canceled ~ lead_time + average_daily_rate + total_nights +
+    total_guests + total_of_special_requests + booking_changes +
+    previous_cancellations + deposit_type + market_segment +
+    customer_type + hotel,
+  data = train_df, ntree = 500, importance = TRUE
+)
+rf_pred <- predict(rf_fit, newdata = test_df, type = "prob")[, "Canceled"]
+auc_rf  <- as.numeric(pROC::auc(pROC::roc(y_test, rf_pred, quiet = TRUE)))
+
+dtrain <- xgboost::xgb.DMatrix(x_train, label = y_train)
+dtest  <- xgboost::xgb.DMatrix(x_test,  label = y_test)
+xgb_params <- list(objective = "binary:logistic", eval_metric = "auc",
+                   eta = 0.05, max_depth = 4,
+                   subsample = 0.8, colsample_bytree = 0.8)
+set.seed(20250101)
+xgb_cv <- xgboost::xgb.cv(params = xgb_params, data = dtrain,
+                          nrounds = 500, nfold = 5,
+                          early_stopping_rounds = 30, verbose = 0)
+best_n <- xgb_cv$best_iteration
+if (is.null(best_n) || length(best_n) == 0 || is.na(best_n)) {
+  best_n <- which.max(xgb_cv$evaluation_log$test_auc_mean)
+}
+set.seed(20250101)
+xgb_fit  <- xgboost::xgb.train(params = xgb_params, data = dtrain,
+                               nrounds = best_n, verbose = 0)
+xgb_pred <- predict(xgb_fit, dtest)
+auc_xgb  <- as.numeric(pROC::auc(pROC::roc(y_test, xgb_pred, quiet = TRUE)))
+
+model_comp <- tibble(
+  Model = c("Logistic (Full)", "Lasso Logistic", "Random Forest", "XGBoost"),
+  AUC   = round(c(auc_val, auc_lasso, auc_rf, auc_xgb), 3)
+)
+write_table(model_comp, "table_08_ml_auc",
+            "Table 8. Machine Learning Model Comparison (AUC)")
+
+safe_plot(vip::vip(rf_fit, num_features = 15) +
+            labs(title = "Random Forest Variable Importance") +
+            theme_minimal(base_size = 12),
+          "fig_rf_importance.png", 8, 6)
+
+tryCatch({
+  shp <- shapviz::shapviz(xgb_fit, X_pred = x_test)
+  safe_plot(shapviz::sv_importance(shp, kind = "beeswarm", max_display = 15) +
+              labs(title = "SHAP Values — XGBoost") +
+              theme_minimal(base_size = 12),
+            "fig_shap_xgb.png", 8, 6)
+}, error = function(e) message("SHAP skipped: ", conditionMessage(e)))
+
+# =============================================================================
+# 8. ADVANCED INFERENTIAL EXTENSIONS
+# =============================================================================
+robust_se <- lmtest::coeftest(logit_full,
+                              vcov = sandwich::vcovHC(logit_full, type = "HC3"))
+cat("\n--- ROBUST (HC3) ---\n"); print(robust_se)
+## 
+## --- ROBUST (HC3) ---
+## 
+## z test of coefficients:
+## 
+##                                 Estimate  Std. Error  z value
+## (Intercept)                   -3.1176028   0.9729988  -3.2041
+## lead_time                      0.0044667   0.0012327   3.6235
+## average_daily_rate             0.0077334   0.0026141   2.9583
+## total_nights                   0.0439517   0.0415164   1.0587
+## total_guests                   0.4104412   0.1423094   2.8841
+## total_of_special_requests     -1.0766828   0.1779889  -6.0492
+## booking_changes               -0.8144984   0.2601699  -3.1306
+## previous_cancellations         2.3132140   1.5033068   1.5388
+## is_repeated_guest              0.3678483   0.8532442   0.4311
+## required_car_parking_spaces  -17.4309057   0.2567236 -67.8976
+## hotelResort Hotel             -0.1612679   0.2182244  -0.7390
+## market_segmentDirect          -0.7264751   0.6531190  -1.1123
+## market_segmentGroups          -0.0050177   0.6256415  -0.0080
+## market_segmentOffline TA/TO   -0.6585158   0.6299639  -1.0453
+## market_segmentOnline TA        1.2286637   0.6133724   2.0031
+## deposit_typeNon Refund        18.7903391   0.3229700  58.1798
+## deposit_typeRefundable       -15.9440391   3.5396340  -4.5044
+## customer_typeGroup           -15.1156167  10.4315690  -1.4490
+## customer_typeTransient         0.5394786   0.6824390   0.7905
+## customer_typeTransient-Party   0.5571331   0.7223754   0.7713
+## arrival_date_monthAugust      -0.7446932   0.4534446  -1.6423
+## arrival_date_monthDecember     0.0287498   0.4975028   0.0578
+## arrival_date_monthFebruary     0.0341690   0.4769939   0.0716
+## arrival_date_monthJanuary     -0.1311390   0.5485246  -0.2391
+## arrival_date_monthJuly        -0.5015968   0.4204927  -1.1929
+## arrival_date_monthJune        -0.1781521   0.4666798  -0.3817
+## arrival_date_monthMarch       -0.1476896   0.4800905  -0.3076
+## arrival_date_monthMay         -0.5525184   0.4099790  -1.3477
+## arrival_date_monthNovember    -0.7083246   0.6849592  -1.0341
+## arrival_date_monthOctober      0.2181750   0.4677952   0.4664
+## arrival_date_monthSeptember   -0.4249223   0.4883904  -0.8700
+##                                           Pr(>|z|)    
+## (Intercept)                              0.0013548 ** 
+## lead_time                                0.0002906 ***
+## average_daily_rate                       0.0030930 ** 
+## total_nights                             0.2897552    
+## total_guests                             0.0039248 ** 
+## total_of_special_requests           0.000000001456 ***
+## booking_changes                          0.0017443 ** 
+## previous_cancellations                   0.1238652    
+## is_repeated_guest                        0.6663831    
+## required_car_parking_spaces  < 0.00000000000000022 ***
+## hotelResort Hotel                        0.4599067    
+## market_segmentDirect                     0.2660021    
+## market_segmentGroups                     0.9936010    
+## market_segmentOffline TA/TO              0.2958737    
+## market_segmentOnline TA                  0.0451635 *  
+## deposit_typeNon Refund       < 0.00000000000000022 ***
+## deposit_typeRefundable              0.000006655083 ***
+## customer_typeGroup                       0.1473303    
+## customer_typeTransient                   0.4292268    
+## customer_typeTransient-Party             0.4405579    
+## arrival_date_monthAugust                 0.1005273    
+## arrival_date_monthDecember               0.9539174    
+## arrival_date_monthFebruary               0.9428932    
+## arrival_date_monthJanuary                0.8110468    
+## arrival_date_monthJuly                   0.2329169    
+## arrival_date_monthJune                   0.7026514    
+## arrival_date_monthMarch                  0.7583650    
+## arrival_date_monthMay                    0.1777630    
+## arrival_date_monthNovember               0.3010838    
+## arrival_date_monthOctober                0.6409363    
+## arrival_date_monthSeptember              0.3842750    
+## ---
+## Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+firth_fit <- logistf::logistf(
+  is_canceled ~ lead_time + deposit_type + market_segment +
+    average_daily_rate + total_nights,
+  data = model_df
+)
+cat("\n--- FIRTH PENALIZED LOGISTIC ---\n"); print(summary(firth_fit))
+## 
+## --- FIRTH PENALIZED LOGISTIC ---
+## logistf::logistf(formula = is_canceled ~ lead_time + deposit_type + 
+##     market_segment + average_daily_rate + total_nights, data = model_df)
+## 
+## Model fitted by Penalized ML
+## Coefficients:
+##                                     coef     se(coef)   lower 0.95   upper 0.95
+## (Intercept)                 -2.209608824 0.4606119129 -3.200960528 -1.363468617
+## lead_time                    0.002973570 0.0008839521  0.001227201  0.004717190
+## deposit_typeNon Refund       6.541953661 1.4121609615  4.580252889 11.384807735
+## deposit_typeRefundable      -0.782794570 1.5340653357 -5.702596383  1.621939591
+## market_segmentDirect        -0.696315643 0.5362059721 -1.728588577  0.409592974
+## market_segmentGroups         0.313199755 0.5017891490 -0.632207927  1.368171552
+## market_segmentOffline TA/TO -0.511080274 0.4952921799 -1.443931060  0.532905446
+## market_segmentOnline TA      0.643468137 0.4516310261 -0.186734402  1.617173871
+## average_daily_rate           0.006003427 0.0017981033  0.002475378  0.009560631
+## total_nights                 0.026863058 0.0328331428 -0.039937353  0.090496099
+##                                  Chisq               p method
+## (Intercept)                 30.7081158 0.0000000299908      2
+## lead_time                   11.0442624 0.0008896209049      2
+## deposit_typeNon Refund             Inf 0.0000000000000      2
+## deposit_typeRefundable       0.3097441 0.5778372771120      2
+## market_segmentDirect         1.5870283 0.2077512152974      2
+## market_segmentGroups         0.3994597 0.5273684052285      2
+## market_segmentOffline TA/TO  0.9916513 0.3193391107498      2
+## market_segmentOnline TA      2.2449650 0.1340499457894      2
+## average_daily_rate          11.1066561 0.0008601844455      2
+## total_nights                 0.6453591 0.4217768285143      2
+## 
+## Method: 1-Wald, 2-Profile penalized log-likelihood, 3-None
+## 
+## Likelihood ratio test=324.7112 on 9 df, p=0, n=985
+## Wald test = 186.1524 on 9 df, p = 0logistf::logistf(formula = is_canceled ~ lead_time + deposit_type + 
+##     market_segment + average_daily_rate + total_nights, data = model_df)
+## Model fitted by Penalized ML
+## Confidence intervals and p-values by Profile Likelihood 
+## 
+## Coefficients:
+##                 (Intercept)                   lead_time 
+##                -2.209608824                 0.002973570 
+##      deposit_typeNon Refund      deposit_typeRefundable 
+##                 6.541953661                -0.782794570 
+##        market_segmentDirect        market_segmentGroups 
+##                -0.696315643                 0.313199755 
+## market_segmentOffline TA/TO     market_segmentOnline TA 
+##                -0.511080274                 0.643468137 
+##          average_daily_rate                total_nights 
+##                 0.006003427                 0.026863058 
+## 
+## Likelihood ratio test=324.7112 on 9 df, p=0, n=985
+table7 <- tibble(
+  Predictor      = names(firth_fit$coefficients),
+  Coefficient    = round(firth_fit$coefficients, 3),
+  SE             = round(sqrt(diag(firth_fit$var)), 4),
+  `95% CI lower` = round(firth_fit$ci.lower, 3),
+  `95% CI upper` = round(firth_fit$ci.upper, 3),
+  p              = round(firth_fit$prob, 4),
+  Sig.           = case_when(firth_fit$prob < 0.001 ~ "***",
+                             firth_fit$prob < 0.01  ~ "**",
+                             firth_fit$prob < 0.05  ~ "*",
+                             TRUE                   ~ "ns")
+)
+write_table(table7, "table_07_firth",
+            "Table 7. Firth Penalized Logistic Regression")
+
+boot_or <- function(data, idx) {
+  m <- glm(is_canceled ~ lead_time + average_daily_rate + total_nights,
+           data = data[idx, ], family = binomial)
+  exp(coef(m))
+}
+set.seed(20250101)
+boot_res <- boot::boot(model_df, boot_or, R = 1000)
+table9 <- tibble(
+  Parameter    = names(boot_res$t0),
+  Original     = round(as.numeric(boot_res$t0), 4),
+  Bias         = round(as.numeric(boot_res$t0 - colMeans(boot_res$t)), 5),
+  `Std. Error` = round(apply(boot_res$t, 2, sd), 5)
+)
+write_table(table9, "table_09_bootstrap",
+            "Table 9. Bootstrap Odds Ratios (R = 1000)")
+
+set.seed(20250101)
+m_out <- MatchIt::matchit(
+  I(deposit_type == "Non Refund") ~ lead_time +
+    average_daily_rate + total_nights + total_guests +
+    market_segment + customer_type,
+  data = model_df, method = "nearest", ratio = 1
+)
+## Warning: glm.fit: fitted probabilities numerically 0 or 1 occurred
+matched     <- MatchIt::match.data(m_out)
+matched_fit <- suppressWarnings(
+  glm(is_canceled ~ I(deposit_type == "Non Refund") +
+        lead_time + average_daily_rate + total_nights,
+      data = matched, family = binomial)
+)
+table10 <- broom::tidy(matched_fit) %>%
+  dplyr::mutate(across(where(is.numeric), ~ round(.x, 4)))
+write_table(table10, "table_10_psm",
+            "Table 10. Propensity-Score Matched Model")
+
+glmer_fit <- suppressWarnings(
+  lme4::glmer(
+    is_canceled ~ lead_time + average_daily_rate + total_nights + (1 | country),
+    data = model_df, family = binomial,
+    control = lme4::glmerControl(optimizer = "bobyqa")
+  )
+)
+cat("\n--- MULTILEVEL MODEL ---\n"); print(summary(glmer_fit))
+## 
+## --- MULTILEVEL MODEL ---
+## Generalized linear mixed model fit by maximum likelihood (Laplace
+##   Approximation) [glmerMod]
+##  Family: binomial  ( logit )
+## Formula: is_canceled ~ lead_time + average_daily_rate + total_nights +  
+##     (1 | country)
+##    Data: model_df
+## Control: lme4::glmerControl(optimizer = "bobyqa")
+## 
+##       AIC       BIC    logLik -2*log(L)  df.resid 
+##    1104.5    1128.9    -547.2    1094.5       980 
+## 
+## Scaled residuals: 
+##     Min      1Q  Median      3Q     Max 
+## -3.1559 -0.6224 -0.4046  0.7511  3.1824 
+## 
+## Random effects:
+##  Groups  Name        Variance Std.Dev.
+##  country (Intercept) 0.403    0.6348  
+## Number of obs: 985, groups:  country, 53
+## 
+## Fixed effects:
+##                      Estimate Std. Error z value             Pr(>|z|)    
+## (Intercept)        -2.6817323  0.3045389  -8.806 < 0.0000000000000002 ***
+## lead_time           0.0060498  0.0007791   7.766  0.00000000000000813 ***
+## average_daily_rate  0.0078581  0.0017380   4.521  0.00000614289584230 ***
+## total_nights        0.0074155  0.0320034   0.232                0.817    
+## ---
+## Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+## 
+## Correlation of Fixed Effects:
+##             (Intr) led_tm avrg__
+## lead_time   -0.302              
+## avrg_dly_rt -0.675  0.145       
+## total_nghts -0.305 -0.198 -0.052
+## optimizer (bobyqa) convergence code: 0 (OK)
+## Model is nearly unidentifiable: very large eigenvalue
+##  - Rescale variables?
+fe          <- summary(glmer_fit)$coefficients
+var_country <- as.numeric(lme4::VarCorr(glmer_fit)$country)
+icc         <- var_country / (var_country + pi^2 / 3)
+
+table11 <- tibble(
+  Predictor = rownames(fe),
+  Estimate  = round(fe[, "Estimate"], 4),
+  SE        = round(fe[, "Std. Error"], 4),
+  z         = round(fe[, "z value"], 3),
+  p         = round(fe[, "Pr(>|z|)"], 4),
+  Sig.      = case_when(fe[, "Pr(>|z|)"] < 0.001 ~ "***",
+                        fe[, "Pr(>|z|)"] < 0.01  ~ "**",
+                        fe[, "Pr(>|z|)"] < 0.05  ~ "*",
+                        TRUE                     ~ "ns")
+)
+write_table(table11, "table_11_multilevel",
+            "Table 11. Multilevel Logistic Model (Country Random Effect)")
+cat("\nICC (country):", round(icc, 3), "\n")
+## 
+## ICC (country): 0.109
+# =============================================================================
+# 9. PUBLICATION-READY OUTPUTS
+# =============================================================================
+table1 <- hotel_clean %>%
+  group_by(Status = is_canceled) %>%
+  summarise(
+    n = n(),
+    `Lead Time M (SD)`        = sprintf("%.1f (%.1f)", mean(lead_time), sd(lead_time)),
+    `ADR M (SD)`              = sprintf("%.1f (%.1f)", mean(average_daily_rate), sd(average_daily_rate)),
+    `Total Nights M (SD)`     = sprintf("%.1f (%.1f)", mean(total_nights), sd(total_nights)),
+    `Special Requests M (SD)` = sprintf("%.1f (%.1f)", mean(total_of_special_requests), sd(total_of_special_requests)),
+    `Repeat Guest %`          = sprintf("%.1f%%", 100 * mean(is_repeated_guest)),
+    .groups = "drop"
+  )
+write_table(table1, "table_01_descriptives",
+            "Table 1. Descriptives by Cancellation Status")
+
+table12_final <- table12 %>%
+  mutate(
+    Firth   = c(NA, NA, NA, NA, NA, NA),
+    XGBoost = c(round(auc_xgb, 3), NA, NA, NA, NA, NA)
+  )
+write_table(table12_final, "table_12_final",
+            "Table 12. Model Discriminatory Power Summary")
+
+headline <- tibble(
+  Rank = 1:8,
+  Predictor = c(
+    "previous_cancellations",
+    "deposit_type = Non Refund",
+    "total_of_special_requests",
+    "booking_changes",
+    "lead_time",
+    "average_daily_rate",
+    "market_segment = Online TA",
+    "Country (random effect)"
+  ),
+  Effect = c(
+    sprintf("OR = %.2f (up risk)", 10.107),
+    sprintf("OR = %.1f (up risk)", exp(6.542)),
+    sprintf("OR = %.2f (down risk)", 0.341),
+    sprintf("OR = %.2f (down risk)", 0.443),
+    sprintf("OR = %.3f/day (up risk)", 1.004),
+    sprintf("OR = %.3f (up risk)", 1.008),
+    sprintf("OR = %.2f (up risk)", 3.417),
+    sprintf("ICC = %.3f", icc)
+  ),
+  `Robust to` = c("HC3 SE, bootstrap", "Firth penalization",
+                  "All models", "All models",
+                  "HC3, bootstrap CI [1.005, 1.007]",
+                  "HC3, multilevel", "HC3", "Multilevel")
+)
+write_table(headline, "table_13_headline_findings",
+            "Consolidated Headline Findings")
+
+# --- Forest plot ---
+safe_plot(
+  or_tab_full %>%
+    dplyr::filter(!Separation) %>%
+    ggplot(aes(x = OR, y = reorder(term, OR))) +
+    geom_point(size = 2, color = "#D7263D") +
+    geom_errorbarh(aes(xmin = `CI lower`, xmax = `CI upper`), height = 0.2) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "grey40") +
+    scale_x_log10() +
+    labs(title = "Odds Ratios for Booking Cancellation (95% CI; separation terms excluded)",
+         x = "Odds Ratio (log scale)",
+         y = NULL) +
+    theme_minimal(base_size = 12),
+  "fig_forest_plot.png", 8, 7)
+## Warning: `geom_errorbarh()` was deprecated in ggplot2 4.0.0.
+## ℹ Please use the `orientation` argument of `geom_errorbar()` instead.
+## This warning is displayed once per session.
+## Call `lifecycle::last_lifecycle_warnings()` to see where this warning was
+## generated.
+## `height` was translated to `width`.
+# --- ROC comparison ---
+tryCatch({
+  png(here::here("figures", "fig_roc_comparison.png"),
+      width = 900, height = 700, res = 120)
+  plot(roc_obj, col = "#2E86AB", lwd = 2,
+       main = "ROC Curves — Model Comparison")
+  if (!is.null(auc_lasso)) {
+    lasso_roc <- pROC::roc(y_test, lasso_pred, quiet = TRUE)
+    plot(lasso_roc, col = "#D7263D", lwd = 2, add = TRUE)
+  }
+  rf_roc  <- pROC::roc(y_test, rf_pred, quiet = TRUE)
+  plot(rf_roc, col = "#F18F01", lwd = 2, add = TRUE)
+  xgb_roc <- pROC::roc(y_test, xgb_pred, quiet = TRUE)
+  plot(xgb_roc, col = "#3B1F2B", lwd = 2, add = TRUE)
+  legend("bottomright",
+         legend = c(paste0("Logistic (AUC=", round(auc_val, 3), ")"),
+                    paste0("Lasso (AUC=",    round(auc_lasso, 3), ")"),
+                    paste0("RF (AUC=",       round(auc_rf, 3), ")"),
+                    paste0("XGBoost (AUC=",  round(auc_xgb, 3), ")")),
+         col = c("#2E86AB", "#D7263D", "#F18F01", "#3B1F2B"),
+         lwd = 2)
+  dev.off()
+}, error = function(e) {
+  if (!is.null(dev.list())) dev.off()
+  message("ROC comparison figure skipped: ", conditionMessage(e))
+})
+## png 
+##   2
+# --- Closing banner + session info ---
+cat("\n============================================\n")
+## 
+## ============================================
+cat("   ANALYSIS COMPLETE\n")
+##    ANALYSIS COMPLETE
+cat("============================================\n")
+## ============================================
+cat("\nTables written to:", here::here("outputs"), "\n")
+## 
+## Tables written to: C:/Users/USER/Downloads/outputs
+cat("Figures written to:", here::here("figures"), "\n\n")
+## Figures written to: C:/Users/USER/Downloads/figures
+print(sessionInfo())
+## R version 4.5.3 (2026-03-11 ucrt)
+## Platform: x86_64-w64-mingw32/x64
+## Running under: Windows 11 x64 (build 22000)
+## 
+## Matrix products: default
+##   LAPACK version 3.12.1
+## 
+## locale:
+## [1] LC_COLLATE=English_United States.utf8 
+## [2] LC_CTYPE=English_United States.utf8   
+## [3] LC_MONETARY=English_United States.utf8
+## [4] LC_NUMERIC=C                          
+## [5] LC_TIME=English_United States.utf8    
+## 
+## time zone: Africa/Lagos
+## tzcode source: internal
+## 
+## attached base packages:
+## [1] stats     graphics  grDevices utils     datasets  methods   base     
+## 
+## other attached packages:
+##  [1] here_1.0.2           logistf_1.26.1       lme4_2.0-1          
+##  [4] MatchIt_4.7.2        shapviz_0.10.4       xgboost_3.2.1.1     
+##  [7] glmnet_5.0           Matrix_1.7-4         pwr_1.3-0           
+## [10] boot_1.3-32          sandwich_3.1-3       lmtest_0.9-40       
+## [13] zoo_1.8-15           nortest_1.0-4        psych_2.6.5         
+## [16] ggpubr_1.0.0         scales_1.4.0         patchwork_1.3.2     
+## [19] kableExtra_1.4.0     knitr_1.52           broom_1.0.13        
+## [22] emmeans_2.0.3        effects_4.2-5        vip_0.4.6           
+## [25] rpart.plot_3.1.4     rpart_4.1.27         randomForest_4.7-1.2
+## [28] caret_7.0-1          lattice_0.22-9       pROC_1.19.0.1       
+## [31] MASS_7.3-65          car_3.1-5            carData_3.0-6       
+## [34] corrplot_0.95        DataExplorer_0.9.0   skimr_2.2.2         
+## [37] janitor_2.2.1        lubridate_1.9.5      forcats_1.0.1       
+## [40] stringr_1.6.0        dplyr_1.2.1          purrr_1.2.2         
+## [43] readr_2.2.0          tidyr_1.3.2          tibble_3.3.1        
+## [46] ggplot2_4.0.3        tidyverse_2.0.0     
+## 
+## loaded via a namespace (and not attached):
+##   [1] splines_4.5.3          hardhat_1.4.3          lifecycle_1.0.5       
+##   [4] Rdpack_2.6.6           formula.tools_1.7.1    rstatix_1.1.0         
+##   [7] rprojroot_2.1.1        globals_0.19.1         vroom_1.7.1           
+##  [10] insight_1.5.0          backports_1.5.1        survey_4.5            
+##  [13] magrittr_2.0.5         rmarkdown_2.32         yaml_2.3.12           
+##  [16] otel_0.2.0             DBI_1.3.0              minqa_1.2.8           
+##  [19] RColorBrewer_1.1-3     multcomp_1.4-30        abind_1.4-8           
+##  [22] nnet_7.3-20            TH.data_1.1-5          ipred_0.9-15          
+##  [25] lava_1.9.1             data.tree_1.2.0        listenv_0.10.1        
+##  [28] parallelly_1.47.0      svglite_2.2.2          codetools_0.2-20      
+##  [31] xml2_1.6.0             tidyselect_1.2.1       shape_1.4.6.1         
+##  [34] farver_2.1.2           stats4_4.5.3           base64enc_0.1-6       
+##  [37] jsonlite_2.0.0         e1071_1.7-17           mitml_0.4-5           
+##  [40] Formula_1.2-6          survival_3.8-6         iterators_1.0.14      
+##  [43] systemfonts_1.3.2      foreach_1.5.2          tools_4.5.3           
+##  [46] ragg_1.5.2             Rcpp_1.1.1             glue_1.8.0            
+##  [49] mnormt_2.1.2           prodlim_2026.03.11     gridExtra_2.3.1       
+##  [52] pan_2.0                chk_0.10.0             xfun_0.57             
+##  [55] mgcv_1.9-4             withr_3.0.3            fastmap_1.2.0         
+##  [58] mitools_2.4            digest_0.6.39          timechange_0.4.0      
+##  [61] R6_2.6.1               estimability_1.5.1     mice_3.19.0           
+##  [64] textshaping_1.0.5      colorspace_2.1-2       networkD3_0.4.1       
+##  [67] generics_0.1.4         data.table_1.18.2.1    recipes_1.3.2         
+##  [70] class_7.3-23           htmlwidgets_1.6.4      ModelMetrics_1.2.2.2  
+##  [73] pkgconfig_2.0.3        gtable_0.3.6           timeDate_4052.112     
+##  [76] S7_0.2.2               htmltools_0.5.9        gower_1.0.2           
+##  [79] reformulas_0.4.4       snakecase_0.11.1       rstudioapi_0.19.0     
+##  [82] tzdb_0.5.0             reshape2_1.4.5         coda_0.19-4.1         
+##  [85] nlme_3.1-169           nloptr_2.2.1           proxy_0.4-29          
+##  [88] repr_1.1.7             operator.tools_1.6.3.1 parallel_4.5.3        
+##  [91] pillar_1.11.1          grid_4.5.3             vctrs_0.7.3           
+##  [94] jomo_2.7-6             xtable_1.8-8           evaluate_1.0.5        
+##  [97] mvtnorm_1.3-7          cli_3.6.6              compiler_4.5.3        
+## [100] crayon_1.5.3           rlang_1.2.0            future.apply_1.20.2   
+## [103] ggsignif_0.6.4         labeling_0.4.3         plyr_1.8.9            
+## [106] stringi_1.8.7          viridisLite_0.4.3      hms_1.1.4             
+## [109] bit64_4.8.0            future_1.70.0          rbibutils_2.4.1       
+## [112] igraph_2.3.1           bit_4.6.0
